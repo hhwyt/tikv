@@ -2,16 +2,9 @@
 
 #![feature(test)]
 
-extern crate test;
 #[macro_use]
 extern crate slog_global;
-
-pub mod encryption;
-mod kv_generator;
-mod logging;
-mod macros;
-mod runner;
-mod security;
+extern crate test;
 
 use std::{
     env,
@@ -32,14 +25,21 @@ pub use crate::{
     security::*,
 };
 
+pub mod encryption;
+mod kv_generator;
+mod logging;
+mod macros;
+mod runner;
+mod security;
+
 pub fn setup_for_ci() {
     // We use backtrace in tests to record suspicious problems. And loading
     // backtrace the first time can take several seconds. Spawning a thread and
     // load it ahead of time to avoid causing timeout.
-    thread::Builder::new()
-        .name(tikv_util::thd_name!("backtrace-loader"))
-        .spawn_wrapper(::backtrace::Backtrace::new)
-        .unwrap();
+    // thread::Builder::new()
+    //     .name(tikv_util::thd_name!("backtrace-loader"))
+    //     .spawn_wrapper(::backtrace::Backtrace::new)
+    //     .unwrap();
 
     if env::var("CI").is_ok() {
         // HACK! Use `epollex` as the polling engine for gRPC when running CI tests on
