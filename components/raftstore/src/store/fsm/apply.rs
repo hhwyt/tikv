@@ -4088,6 +4088,14 @@ where
             self.delegate.apply_state.get_commit_index(),
             self.delegate.apply_state.get_commit_term(),
         );
+
+        info!("handle apply";
+            "region_id"   => self.delegate.region_id(),
+            "peer_id" => self.delegate.id(),
+            "commit_index" => apply.commit_index,
+            "commit_term" => apply.commit_term
+        );
+
         let cur_state = (apply.commit_index, apply.commit_term);
         if prev_state.0 > cur_state.0 || prev_state.1 > cur_state.1 {
             panic!(

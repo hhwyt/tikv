@@ -1806,7 +1806,7 @@ where
             let to_peer_id = msg.get_to_peer().get_id();
             let to_store_id = msg.get_to_peer().get_store_id();
 
-            debug!(
+            info!(
                 "send raft msg";
                 "region_id" => self.region_id,
                 "peer_id" => self.peer.get_id(),
@@ -2798,7 +2798,7 @@ where
             panic!("{} wants to handle ready", self.tag);
         });
 
-        debug!(
+        info!(
             "handle raft ready";
             "region_id" => self.region_id,
             "peer_id" => self.peer.get_id(),

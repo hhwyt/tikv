@@ -2163,7 +2163,7 @@ impl<'a, EK: KvEngine, ER: RaftEngine, T: Transport> StoreFsmDelegate<'a, EK, ER
             Err(_) => unreachable!(),
         };
 
-        debug!(
+        info!(
             "handle raft message";
             "from_peer_id" => msg.get_from_peer().get_id(),
             "to_peer_id" => msg.get_to_peer().get_id(),
