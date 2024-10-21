@@ -3992,6 +3992,18 @@ where
             return Some("pending conf change");
         }
 
+        // TODO(hwy): Test only! Delete before merging into master.
+        if self.raft_group.raft.has_pending_conf() {
+            info!(
+                "transfer leader has pending conf";
+                "region_id" => self.region_id,
+                "target_peer_id" => peer_id,
+                "pending_conf_index" => self.raft_group.raft.pending_conf_index,
+                "leader_applied_index" => self.raft_group.raft.raft_log.applied,
+                "target_applied_index" => index
+            );
+        }
+
         let last_index = self.get_store().last_index();
         if last_index >= index + ctx.cfg.leader_transfer_max_log_lag {
             return Some("log gap");
