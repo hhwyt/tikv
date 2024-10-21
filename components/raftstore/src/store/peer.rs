@@ -3992,10 +3992,9 @@ where
             return Some("pending conf change");
         }
 
-        // TODO(hwy): Test only! Delete before merging into master.
         if self.raft_group.raft.has_pending_conf() {
             info!(
-                "transfer leader has pending conf";
+                "transfer leader with pending conf";
                 "region_id" => self.region_id,
                 "target_peer_id" => peer_id,
                 "pending_conf_index" => self.raft_group.raft.pending_conf_index,
