@@ -3788,6 +3788,11 @@ where
             return false;
         }
 
+        fail_point!("propose_locks_before_transfer_leader", |_| {
+            pessimistic_locks.status = LocksStatus::TransferringLeader;
+            true
+        });
+
         // If it is not writable, it's probably because it's a retried TransferLeader
         // and the locks have been proposed. But we still need to return true to
         // propose another TransferLeader command. Otherwise, some write requests that
@@ -5872,7 +5877,7 @@ where
                 "failed to propose";
                 "region_id" => self.region_id(),
                 "peer_id" => self.fsm.peer_id(),
-                "admin_cmd_type" => ?admin_cmd_type,
+                "admin_cmd_type" => ?admin_cmd_type.unwrap(),
             );
         }
 
