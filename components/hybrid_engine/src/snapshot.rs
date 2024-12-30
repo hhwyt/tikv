@@ -6,7 +6,7 @@ use std::{
 };
 
 use engine_traits::{
-    is_data_cf, CfNamesExt, IterOptions, Iterable, KvEngine, Peekable, ReadOptions,
+    is_data_cf, CfNamesExt, FileMetadata, IterOptions, Iterable, KvEngine, Peekable, ReadOptions,
     RegionCacheEngine, Result, Snapshot, SnapshotMiscExt, CF_DEFAULT,
 };
 use in_memory_engine::RegionCacheMemoryEngine;
@@ -109,6 +109,14 @@ where
             }
             _ => HybridEngineIterator::disk_engine_iterator(self.disk_snap.iterator_opt(cf, opts)?),
         })
+    }
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)> {
+        panic!()
     }
 }
 

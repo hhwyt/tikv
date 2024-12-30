@@ -32,6 +32,7 @@ use security::SecurityManager;
 use test_raftstore::*;
 use test_raftstore_macro::test_case;
 use test_raftstore_v2::WrapFactory;
+use test_util::init_log_for_test;
 use tikv::server::{snap::send_snap, tablet_snap::send_snap as send_snap_v2};
 use tikv_util::{
     config::*,
@@ -1259,4 +1260,114 @@ fn test_node_apply_snapshot_by_or_without_ingest() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+#[test]
+fn test_cluster_with_lmax_and_tiny_values_versioning() {
+    init_log_for_test();
+
+    use std::sync::Arc;
+
+    use test_raftstore::*;
+    use tikv_util::config::ReadableDuration;
+
+    let mut cluster = new_server_cluster(0, 2);
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::millis(50);
+    cluster.cfg.raft_store.raft_log_gc_count_limit = Some(50);
+    cluster.cfg.raft_store.snap_gc_timeout = ReadableDuration::millis(300);
+    cluster.pd_client.disable_default_operator();
+    cluster.run_conf_change();
+    println!("engine 1: {:?}", cluster.get_engine(1));
+    let pd_client = Arc::clone(&cluster.pd_client);
+    let region = cluster.get_region(b"");
+    cluster.must_split(&region, b"b");
+    cluster.must_split(&cluster.get_region(b"b"), b"c");
+    cluster.must_split(&cluster.get_region(b"c"), b"d");
+    cluster.must_split(&cluster.get_region(b"d"), b"e");
+    cluster.must_split(&cluster.get_region(b"e"), b"f");
+
+    let lmax_value = vec![b'v'; 1000];
+    let non_lmax_value = vec![b'n'; 1];
+    let lmax_regions_data: Vec<(&[u8], usize, bool)> = vec![
+        (b"a", 15, true),  // Region 1: 写入 15 条 Lmax 数据，flush 后 compact
+        (b"b", 10, true),  // Region 2: 写入 10 条 Lmax 数据，flush 后 compact
+        (b"c", 3, false),  // Region 3: 写入 3 条 Lmax 数据，只 flush
+        (b"d", 23, false), // Region 4: 写入 23 条 Lmax 数据，flush 后合并 compact
+        (b"e", 13, false), // Region 5: 写入 13 条 Lmax 数据，flush 后合并 compact
+    ];
+
+    let non_lmax_region_data: Vec<(&[u8], usize)> = vec![
+        (b"a", 10), // Region 1: 写入 10 条 tiny 数据
+        (b"e", 10), // Region 5: 写入 10 条 tiny 数据
+        (b"f", 10), // Region 6: 写入 10 条 tiny 数据
+    ];
+
+    // 写入 Lmax 数据
+    for (region_start, count, compact_after_flush) in &lmax_regions_data {
+        for i in 1..=*count {
+            let key = format!("{}{:02}", String::from_utf8_lossy(region_start), i).into_bytes();
+            cluster.must_put_cf("default", &key, &lmax_value);
+        }
+        cluster.must_flush_cf("default", true);
+
+        if *compact_after_flush {
+            cluster.must_compact_files_in_range_cf("default", None, None, Some(6));
+        }
+    }
+
+    // 合并 compact 操作：Region 4 和 Region 5
+    cluster.must_compact_files_in_range_cf("default", None, None, Some(6));
+
+    // 写入 Tiny value 数据
+    for (region_start, count) in &non_lmax_region_data {
+        for i in 1..=*count {
+            let key = format!("{}{:02}", String::from_utf8_lossy(region_start), i).into_bytes();
+            cluster.must_put_cf("default", &key, &non_lmax_value);
+        }
+        cluster.must_flush_cf("default", true);
+        // cluster.must_compact_files_in_range_cf("default", None, None,
+        // Some(1));
+    }
+
+    // 为每个 region 添加副本
+    let regions = vec![
+        cluster.get_region(b"a"),
+        cluster.get_region(b"b"),
+        cluster.get_region(b"c"),
+        cluster.get_region(b"d"),
+        cluster.get_region(b"e"),
+        cluster.get_region(b"f"),
+    ];
+
+    let mut peer_id = 2;
+    for region in &regions {
+        pd_client.must_add_peer(region.get_id(), new_peer(2, peer_id));
+        peer_id += 1;
+    }
+    cluster.must_flush_cf("default", true);
+
+    println!("engine 2: {:?}", cluster.get_engine(2));
+
+    // 验证 Lmax 和 Tiny 数据的一致性
+    // for (region_start, count, _) in &lmax_regions_data {
+    //     for i in 1..=*count {
+    //         let key = format!("{}{:02}", String::from_utf8_lossy(region_start),
+    // i).into_bytes();         if *region_start == b"a" || *region_start ==
+    // b"e" {             // Region 1 和 Region 5：Lmax 和 Tiny 都有，应该是
+    // Tiny 的值             must_get_equal(&cluster.get_engine(2), &key,
+    // &non_lmax_value);         } else {
+    //             // 其他 regions：只有 Lmax，应该是 Lmax 的值
+    //             must_get_equal(&cluster.get_engine(2), &key, &lmax_value);
+    //         }
+    //     }
+    // }
+
+    // 验证 Tiny 数据一致性
+    for (region_start, count) in &non_lmax_region_data {
+        for i in 1..=*count {
+            let key = format!("{}{:02}", String::from_utf8_lossy(region_start), i).into_bytes();
+            must_get_equal(&cluster.get_engine(2), &key, &non_lmax_value);
+        }
+    }
+    sleep_ms(3600000);
 }

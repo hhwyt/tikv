@@ -1,11 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine_traits::{
-    IterMetricsCollector, IterOptions, Iterable, Iterator, KvEngine, MetricsExt, Peekable,
-    ReadOptions, Result, SyncMutable, WriteOptions,
+    FileMetadata, IterMetricsCollector, IterOptions, Iterable, Iterator, KvEngine, MetricsExt,
+    Peekable, ReadOptions, Result, SyncMutable,
 };
 
-use crate::{db_vector::PanicDbVector, snapshot::PanicSnapshot, write_batch::PanicWriteBatch};
+use crate::{db_vector::PanicDbVector, snapshot::PanicSnapshot};
 
 #[derive(Clone, Debug)]
 pub struct PanicEngine;
@@ -70,6 +70,14 @@ impl Iterable for PanicEngine {
     type Iterator = PanicEngineIterator;
 
     fn iterator_opt(&self, cf: &str, opts: IterOptions) -> Result<Self::Iterator> {
+        panic!()
+    }
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)> {
         panic!()
     }
 }

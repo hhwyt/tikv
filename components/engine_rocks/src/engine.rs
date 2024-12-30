@@ -2,7 +2,9 @@
 
 use std::{any::Any, sync::Arc};
 
-use engine_traits::{IterOptions, Iterable, KvEngine, Peekable, ReadOptions, Result, SyncMutable};
+use engine_traits::{
+    FileMetadata, IterOptions, Iterable, KvEngine, Peekable, ReadOptions, Result, SyncMutable,
+};
 use rocksdb::{DBIterator, Writable, DB};
 
 use crate::{
@@ -212,6 +214,14 @@ impl Iterable for RocksEngine {
             handle,
             opt.into_raw(),
         )))
+    }
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)> {
+        panic!()
     }
 }
 

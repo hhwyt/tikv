@@ -1,11 +1,13 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::iter::Iterator;
+
 use engine_traits::{
-    CfNamesExt, DeleteStrategy, ImportExt, IterOptions, Iterable, Iterator, MiscExt, Mutable,
-    Range, RangeStats, Result, SstWriter, SstWriterBuilder, WriteBatch, WriteBatchExt,
-    WriteOptions,
+    CfNamesExt, DeleteStrategy, FileMetadata, ImportExt, IterOptions, Iterable,
+    Iterator as EngineIterator, MiscExt, Mutable, Range, RangeStats, Result, SstWriter,
+    SstWriterBuilder, WriteBatch, WriteBatchExt, WriteOptions,
 };
-use rocksdb::{FlushOptions, Range as RocksRange};
+use rocksdb::{ColumnFamilyMetaData, FlushOptions, Range as RocksRange};
 use tikv_util::{box_try, keybuilder::KeyBuilder};
 
 use crate::{
@@ -312,6 +314,38 @@ impl MiscExt for RocksEngine {
             })
             .collect();
         Ok(ret)
+    }
+
+    fn get_lmax(&self, cf: &str) -> Result<usize> {
+        let handle = util::get_cf_handle(self.as_inner(), cf)?;
+        let binding = self.as_inner().get_column_family_meta_data(handle);
+        let levels = binding.get_levels();
+
+        for i in (0..levels.len()).rev() {
+            if levels[i].get_files().len() > 0 {
+                return Ok(i);
+            }
+        }
+
+        Ok(0)
+    }
+
+    fn get_level_metadata(&self, cf: &str, level: usize) -> Result<Vec<FileMetadata>> {
+        let handle = util::get_cf_handle(self.as_inner(), cf)?;
+        let cf_meta = self.as_inner().get_column_family_meta_data(handle);
+        let level_meta = cf_meta.get_level(level);
+        let sst_metadata: Vec<FileMetadata> = level_meta
+            .get_files()
+            .iter()
+            .map(|sst_meta| FileMetadata {
+                name: sst_meta.get_name().clone(),
+                size: sst_meta.get_size() as usize,
+                smallest_key: sst_meta.get_smallestkey().clone().into(),
+                largest_key: sst_meta.get_largestkey().clone().into(),
+            })
+            .collect();
+
+        Ok(sst_metadata)
     }
 
     fn get_engine_used_size(&self) -> Result<u64> {

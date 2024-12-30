@@ -130,10 +130,24 @@ pub trait MetricsExt {
     fn metrics_collector(&self) -> Self::Collector;
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct FileMetadata {
+    pub name: String,
+    pub size: usize,
+    pub smallest_key: Vec<u8>,
+    pub largest_key: Vec<u8>,
+}
+
 pub trait Iterable {
     type Iterator: Iterator + MetricsExt;
 
     fn iterator_opt(&self, cf: &str, opts: IterOptions) -> Result<Self::Iterator>;
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)>;
 
     fn iterator(&self, cf: &str) -> Result<Self::Iterator> {
         self.iterator_opt(cf, IterOptions::default())
@@ -155,6 +169,23 @@ pub trait Iterable {
         let iter_opt = iter_option(start_key, end_key, fill_cache);
         scan_impl(self.iterator_opt(cf, iter_opt)?, start_key, f)
     }
+
+    // fn scan_with_filter_level<F>(
+    //     &self,
+    //     cf: &str,
+    //     start_key: &[u8],
+    //     end_key: &[u8],
+    //     fill_cache: bool,
+    //     filter_level: u32,
+    //     f: F,
+    // ) -> Result<()>
+    // where
+    //     F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    // {
+    //     let mut iter_opt = iter_option(start_key, end_key, fill_cache);
+    //     // iter_opt.set_filter_level(filter_level);
+    //     scan_impl(self.iterator_opt(cf, iter_opt)?, start_key, f)
+    // }
 
     // Seek the first key >= given key, if not found, return None.
     fn seek(&self, cf: &str, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {

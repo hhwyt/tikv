@@ -525,6 +525,49 @@ impl TablePropertiesCollectorFactory<MvccPropertiesCollector> for MvccProperties
     }
 }
 
+/// A new collector to store the level of an SST file.
+pub struct LevelCollector {
+    level: u64, // The level of the SST file
+}
+
+impl LevelCollector {
+    fn new(level: u64) -> Self {
+        LevelCollector { level }
+    }
+}
+
+impl TablePropertiesCollector for LevelCollector {
+    fn add(&mut self, _key: &[u8], _value: &[u8], _entry_type: DBEntryType, _: u64, _: u64) {
+        // No-op: We only care about level information, which is static for a
+        // file.
+    }
+
+    fn finish(&mut self) -> HashMap<Vec<u8>, Vec<u8>> {
+        let mut result = HashMap::new();
+
+        // Encode the level as a user property
+        result.insert(b"file_level".to_vec(), self.level.to_le_bytes().to_vec());
+        result
+    }
+}
+
+/// A factory to create `LevelCollector`.
+pub struct LevelCollectorFactory {
+    level: u64, // The level to assign to the SST files
+}
+
+impl LevelCollectorFactory {
+    pub fn new(level: u64) -> Self {
+        LevelCollectorFactory { level }
+    }
+}
+
+impl TablePropertiesCollectorFactory<LevelCollector> for LevelCollectorFactory {
+    fn create_table_properties_collector(&mut self, _: u32) -> LevelCollector {
+        LevelCollector::new(self.level)
+    }
+}
+
 #[derive(Default)]
 pub struct RawMvccPropertiesCollectorFactory {}
 

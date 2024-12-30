@@ -1,7 +1,8 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use rocksdb::{
-    ReadOptions as RawReadOptions, TableFilter, TableProperties, WriteOptions as RawWriteOptions,
+    LevelFilter, ReadOptions as RawReadOptions, TableFilter, TableProperties,
+    WriteOptions as RawWriteOptions,
 };
 use tikv_util::codec::number;
 
@@ -84,6 +85,10 @@ fn build_read_opts(iter_opts: engine_traits::IterOptions) -> RawReadOptions {
         ))
     }
 
+    if iter_opts.get_filter_lmax() {
+        opts.set_filter_lmax(true);
+    }
+
     let (lower, upper) = iter_opts.build_bounds();
     if let Some(lower) = lower {
         opts.set_iterate_lower_bound(lower);
@@ -141,6 +146,26 @@ impl TableFilter for TsFilter {
             }
         }
 
+        true
+    }
+}
+
+struct LmaxFilter {
+    lmax: u32,
+}
+
+impl LmaxFilter {
+    pub fn new(lmax: u32) -> LmaxFilter {
+        LmaxFilter { lmax }
+    }
+}
+
+impl LevelFilter for LmaxFilter {
+    fn level_filter(&self, level: u32) -> bool {
+        if level == self.lmax {
+            // this sst will not be scanned
+            return false;
+        }
         true
     }
 }

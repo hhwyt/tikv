@@ -95,6 +95,8 @@ pub struct IterOptions {
     // never fail a request as incomplete, even on skipping too many keys.
     // It's used to avoid encountering too many tombstones when seeking.
     max_skippable_internal_keys: u64,
+    // Specifies the level to be filtered during iteration.
+    filter_lmax: bool,
 }
 
 impl IterOptions {
@@ -113,6 +115,7 @@ impl IterOptions {
             key_only: false,
             seek_mode: SeekMode::TotalOrder,
             max_skippable_internal_keys: 0,
+            filter_lmax: false,
         }
     }
 
@@ -247,6 +250,16 @@ impl IterOptions {
     pub fn set_max_skippable_internal_keys(&mut self, threshold: u64) {
         self.max_skippable_internal_keys = threshold;
     }
+
+    #[inline]
+    pub fn set_filter_lmax(&mut self, filter_lmax: bool) {
+        self.filter_lmax = filter_lmax;
+    }
+
+    #[inline]
+    pub fn get_filter_lmax(&self) -> bool {
+        self.filter_lmax
+    }
 }
 
 impl Default for IterOptions {
@@ -261,6 +274,7 @@ impl Default for IterOptions {
             key_only: false,
             seek_mode: SeekMode::TotalOrder,
             max_skippable_internal_keys: 0,
+            filter_lmax: false,
         }
     }
 }

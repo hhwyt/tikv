@@ -229,6 +229,7 @@ fn retry_delete_snapshot(mgr: &SnapManagerCore, key: &SnapKey, snap: &Snapshot) 
 // into file.
 pub fn gen_snapshot_meta(cf_files: &[CfFile], for_balance: bool) -> RaftStoreResult<SnapshotMeta> {
     let mut meta = Vec::with_capacity(cf_files.len());
+    let mut cf_num_lmax_files = Vec::with_capacity(cf_files.len());
     for cf_file in cf_files {
         if !SNAPSHOT_CFS.iter().any(|cf| cf_file.cf == *cf) {
             return Err(box_err!(
@@ -252,10 +253,12 @@ pub fn gen_snapshot_meta(cf_files: &[CfFile], for_balance: bool) -> RaftStoreRes
             cf_file_meta.set_checksum(0);
             meta.push(cf_file_meta);
         }
+        cf_num_lmax_files.push(cf_file.num_lmax_files);
     }
     let mut snapshot_meta = SnapshotMeta::default();
     snapshot_meta.set_cf_files(meta.into());
     snapshot_meta.set_for_balance(for_balance);
+    snapshot_meta.set_cf_num_lmax_files(cf_num_lmax_files.into());
     Ok(snapshot_meta)
 }
 
@@ -333,6 +336,7 @@ pub struct CfFile {
     pub kv_count: u64,
     pub size: Vec<u64>,
     pub checksum: Vec<u32>,
+    num_lmax_files: u32,
 }
 
 impl CfFile {
@@ -743,6 +747,13 @@ impl Snapshot {
                 }
             }
         }
+        assert_eq!(snapshot_meta.cf_num_lmax_files.len(), self.cf_files.len());
+        cf_idx = 0;
+        for &num_lmax_files in snapshot_meta.get_cf_num_lmax_files() {
+            self.cf_files[cf_idx].num_lmax_files = num_lmax_files;
+            cf_idx += 1;
+        }
+
         self.meta_file.meta = Some(snapshot_meta);
         Ok(())
     }
@@ -889,7 +900,7 @@ impl Snapshot {
                     &end_key,
                 )?
             } else {
-                snap_io::build_sst_cf_file_list::<EK>(
+                match snap_io::build_sst_cf_file_list_new::<EK>(
                     cf_file,
                     engine,
                     kv_snap,
@@ -900,7 +911,16 @@ impl Snapshot {
                     &self.mgr.limiter,
                     self.mgr.encryption_key_manager.clone(),
                     for_balance,
-                )?
+                ) {
+                    Ok(result) => result.0,
+                    Err(e) => {
+                        println!(
+                            "Failed to build SST CF file list for begin_key: {:?}, end_key: {:?}, error: {:?}",
+                            begin_key, end_key, e
+                        );
+                        panic!();
+                    }
+                }
             };
             SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
                 .kv
@@ -1193,8 +1213,14 @@ impl Snapshot {
                         &mut cb,
                     )?;
                 } else {
-                    // Apply the snapshot by ingest.
-                    snap_io::apply_sst_cf_files_by_ingest(clone_files.as_slice(), &options.db, cf)?;
+                    let num_lmax_files = cf_file.num_lmax_files as usize;
+                    let (first_batch, second_batch) = clone_files.split_at(num_lmax_files);
+                    if !first_batch.is_empty() {
+                        snap_io::apply_sst_cf_files_by_ingest(first_batch, &options.db, cf)?;
+                    }
+                    if !second_batch.is_empty() {
+                        snap_io::apply_sst_cf_files_by_ingest(second_batch, &options.db, cf)?;
+                    }
                     coprocessor_host.post_apply_sst_from_snapshot(&region, cf, path);
                 }
             }
@@ -2039,13 +2065,15 @@ impl SnapManagerCore {
     }
 
     pub fn can_apply_cf_without_ingest(&self, cf_size: u64, cf_kvs: u64) -> bool {
-        if self.min_ingest_cf_size == 0 {
-            return false;
-        }
+        return false;
+        // if self.min_ingest_cf_size == 0 {
+        //     return false;
+        // }
         // If the size and the count of keys of cf are relatively small, it's
         // recommended to directly write it into kvdb rather than ingest,
         // for mitigating performance issue when ingesting snapshot.
-        cf_size <= self.min_ingest_cf_size && cf_kvs <= self.min_ingest_cf_kvs
+        // cf_size <= self.min_ingest_cf_size && cf_kvs <=
+        // self.min_ingest_cf_kvs
     }
 }
 

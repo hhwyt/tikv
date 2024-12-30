@@ -3,14 +3,19 @@ use std::{
     cell::RefCell,
     fs,
     io::{self, BufReader, Read, Write},
+    iter::Iterator,
+    path::Path,
     sync::Arc,
+    thread::sleep_ms,
     usize,
 };
 
 use encryption::{DataKeyManager, DecrypterReader, EncrypterWriter, Iv};
+use engine_rocks::util;
 use engine_traits::{
-    CfName, Error as EngineError, ExternalSstFileInfo, IterOptions, Iterable, Iterator, KvEngine,
-    Mutable, RefIterable, SstCompressionType, SstReader, SstWriter, SstWriterBuilder, WriteBatch,
+    iter_option, CfName, Error as EngineError, ExternalSstFileInfo, FileMetadata, IterOptions,
+    Iterable, Iterator as EngineIterator, KvEngine, Mutable, RefIterable, SstCompressionType,
+    SstReader, SstWriter, SstWriterBuilder, WriteBatch, CF_DEFAULT, CF_WRITE,
 };
 use fail::fail_point;
 use file_system::{File, IoBytesTracker, IoType, OpenOptions, WithIoType};
@@ -124,11 +129,119 @@ where
 
     Ok(stats)
 }
+#[derive(Debug, PartialEq)]
+pub struct SstFileInfo {
+    pub file_name: String,
+    pub smallest_key: Vec<u8>,
+    pub largest_key: Vec<u8>,
+    pub num_entries: u64,
+}
 
-/// Build a snapshot file for the given column family in sst format.
-/// If there are no key-value pairs fetched, no files will be created at `path`,
-/// otherwise the file will be created and synchronized.
-pub fn build_sst_cf_file_list<E>(
+fn get_lmax(files_metadata_by_level: &Vec<Vec<FileMetadata>>) -> u32 {
+    for i in (0..files_metadata_by_level.len()).rev() {
+        if files_metadata_by_level[i].len() > 0 {
+            return i as u32;
+        }
+    }
+
+    0
+}
+
+fn try_filter_lmax<E>(
+    cf_file: &mut CfFile,
+    engine: &E,
+    start_key: &[u8],
+    end_key: &[u8],
+    file_id: &mut usize,
+    files_metadata_by_level: Vec<Vec<FileMetadata>>,
+) -> Result<(usize, Option<Vec<FileMetadata>>), Error>
+where
+    E: KvEngine,
+{
+    let cf = cf_file.cf;
+    let lmax = get_lmax(&files_metadata_by_level) as usize;
+    if lmax == 0 {
+        return Ok((0, None));
+    }
+
+    let lmax_file_metadata = &files_metadata_by_level[lmax];
+
+    // Filter files that belong to this region
+    let region_files: Vec<_> = lmax_file_metadata
+        .iter()
+        .filter(|file| {
+            let smallest = file.smallest_key.as_slice();
+            let largest = file.largest_key.as_slice();
+            smallest < end_key && largest > start_key
+        })
+        .cloned()
+        .collect();
+    let total_region_files = region_files.len(); // Total files belonging to the region
+
+    // Find exclusive files
+    let mut exclusive_files: Vec<FileMetadata> = region_files
+        .into_iter()
+        .filter(|file| {
+            let smallest = file.smallest_key.as_slice();
+            let largest = file.largest_key.as_slice();
+            smallest >= start_key && largest <= end_key
+        })
+        .collect();
+
+    let exclusive_count = exclusive_files.len(); // Count of exclusive files
+    println!(
+        "Region Lmax Info: total_region_files={}, exclusive_files={}",
+        total_region_files, exclusive_count
+    );
+
+    // If the counts do not match, return early with lmax = 0 and an empty vector
+    if total_region_files != exclusive_count {
+        return Ok((0, None));
+    }
+
+    // Create hard links for each exclusive file
+    for file in &mut exclusive_files {
+        let src_path_str = format!("{}{}", engine.path(), file.name);
+        let src_path = Path::new(&src_path_str);
+        let dest_name = cf_file.gen_tmp_file_name(*file_id);
+        let dest_path = cf_file.path.join(dest_name.clone());
+
+        println!(
+            "Hard link, source path: {:?}, dest path: {:?}",
+            src_path, dest_path
+        );
+
+        fs::hard_link(&src_path, &dest_path).map_err(|e| {
+            error!(
+                "failed to create hard link for file in max level";
+                "src" => src_path.display(),
+                "dest" => dest_path.display(),
+                "err" => ?e,
+            );
+            io::Error::new(io::ErrorKind::Other, format!("Hard link failed: {:?}", e))
+        })?;
+
+        file.name = dest_name;
+        cf_file.add_file(*file_id); // Add the file to CfFile
+        *file_id += 1;
+    }
+
+    Ok((lmax, Some(exclusive_files)))
+}
+
+fn scan_helper<Iter, F>(mut it: Iter, start_key: &[u8], mut f: F) -> Result<(), Error>
+where
+    Iter: engine_traits::Iterator,
+    F: FnMut(&[u8], &[u8]) -> Result<bool, Error>,
+{
+    let mut remained = it.seek(start_key)?;
+    while remained {
+        remained = f(it.key(), it.value())? && it.next()?;
+    }
+    Ok(())
+}
+
+pub fn build_sst_cf_file_list_new<E>(
     cf_file: &mut CfFile,
     engine: &E,
     snap: &E::Snapshot,
@@ -138,14 +251,36 @@ pub fn build_sst_cf_file_list<E>(
     io_limiter: &Limiter,
     key_mgr: Option<Arc<DataKeyManager>>,
     for_balance: bool,
-) -> Result<BuildStatistics, Error>
+) -> Result<(BuildStatistics, Vec<FileMetadata>, Vec<SstFileInfo>), Error>
 where
     E: KvEngine,
 {
     let cf = cf_file.cf;
-    let mut stats = BuildStatistics::default();
-    let mut remained_quota = 0;
     let mut file_id: usize = 0;
+    let mut iter_opt = iter_option(start_key, end_key, false);
+    iter_opt.set_filter_lmax(true);
+    let (mut iter, files_metadata_by_level) =
+        snap.iterator_opt_and_get_metadata(cf, iter_opt).unwrap();
+    // Handle lmax
+    let (_, direct_ssts_info) = try_filter_lmax(
+        cf_file,
+        engine,
+        start_key,
+        end_key,
+        &mut file_id,
+        files_metadata_by_level,
+    )?;
+
+    let mut stats = BuildStatistics::default();
+    if direct_ssts_info.is_none() {
+        iter_opt = iter_option(start_key, end_key, false);
+        iter = snap.iterator_opt(cf, iter_opt).unwrap();
+    } else {
+        cf_file.num_lmax_files = direct_ssts_info.clone().unwrap().len() as u32;
+    }
+
+    let mut generated_ssts_info = Vec::new();
+    let mut remained_quota = 0;
     let mut path = cf_file
         .path
         .join(cf_file.gen_tmp_file_name(file_id))
@@ -158,7 +293,7 @@ where
     let finish_sst_writer = |sst_writer: E::SstWriter,
                              path: String,
                              key_mgr: Option<Arc<DataKeyManager>>|
-     -> Result<u64, Error> {
+     -> Result<SstFileInfo, Error> {
         let info = sst_writer.finish()?;
         (|| {
             fail_point!("inject_sst_file_corruption", |_| {
@@ -183,8 +318,6 @@ where
 
         let sst_reader = E::SstReader::open(&path, key_mgr)?;
         if let Err(e) = sst_reader.verify_checksum() {
-            // use sst reader to verify block checksum, it would detect corrupted SST due to
-            // memory bit-flip
             fs::remove_file(&path)?;
             error!(
                 "failed to pass block checksum verification";
@@ -194,7 +327,191 @@ where
             return Err(io::Error::new(io::ErrorKind::InvalidData, e).into());
         }
         File::open(&path).and_then(|f| f.sync_all())?;
-        Ok(info.file_size())
+
+        let sst_file_info = SstFileInfo {
+            file_name: path.clone().rsplit('/').next().unwrap_or(&path).to_string(),
+            smallest_key: info.smallest_key().to_vec(),
+            largest_key: info.largest_key().to_vec(),
+            num_entries: info.num_entries(),
+        };
+        Ok(sst_file_info)
+    };
+
+    let instant = Instant::now();
+    let _io_type_guard = WithIoType::new(if for_balance {
+        IoType::LoadBalance
+    } else {
+        IoType::Replication
+    });
+
+    let mut io_tracker = IoBytesTracker::new();
+    let mut next_io_check_size = stats.total_kv_size + SCAN_BYTES_PER_IO_LIMIT_CHECK;
+    let handle_read_io_usage = |io_tracker: &mut IoBytesTracker, remained_quota: &mut usize| {
+        if let Some(io_bytes_delta) = io_tracker.update() {
+            while io_bytes_delta.read as usize > *remained_quota {
+                io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
+                *remained_quota += IO_LIMITER_CHUNK_SIZE;
+            }
+            *remained_quota -= io_bytes_delta.read as usize;
+        }
+    };
+
+    let scan_fn = |key: &[u8], value: &[u8]| -> Result<bool, Error> {
+        let entry_len = key.len() + value.len();
+        if file_length + entry_len > raw_size_per_file as usize {
+            cf_file.add_file(file_id); // add previous file
+            file_length = 0;
+            file_id += 1;
+            let prev_path = path.clone();
+            path = cf_file
+                .path
+                .join(cf_file.gen_tmp_file_name(file_id))
+                .to_str()
+                .unwrap()
+                .to_string();
+            let result = create_sst_file_writer::<E>(engine, cf, &path);
+            match result {
+                Ok(new_sst_writer) => {
+                    let old_writer = sst_writer.replace(new_sst_writer);
+                    let sst_info =
+                        box_try!(finish_sst_writer(old_writer, prev_path, key_mgr.clone()));
+                    stats.total_sst_size += sst_info.num_entries as usize;
+                    generated_ssts_info.push(sst_info);
+                }
+                Err(e) => {
+                    let io_error = io::Error::new(io::ErrorKind::Other, e);
+                    return Err(io_error.into());
+                }
+            }
+        }
+
+        stats.key_count += 1;
+        stats.total_kv_size += entry_len;
+
+        if stats.total_kv_size >= next_io_check_size {
+            handle_read_io_usage(&mut io_tracker, &mut remained_quota);
+            next_io_check_size = stats.total_kv_size + SCAN_BYTES_PER_IO_LIMIT_CHECK;
+        }
+
+        if let Err(e) = sst_writer.borrow_mut().put(key, value) {
+            let io_error = io::Error::new(io::ErrorKind::Other, e);
+            return Err(io_error.into());
+        }
+        file_length += entry_len;
+        Ok(true)
+    };
+
+    // Handle non-lmax
+    scan_helper(iter, start_key, scan_fn);
+    println!("scanned key_count: {}, ", stats.key_count);
+    handle_read_io_usage(&mut io_tracker, &mut remained_quota);
+    if stats.key_count > 0 {
+        let final_sst_info = box_try!(finish_sst_writer(sst_writer.into_inner(), path, key_mgr));
+        stats.total_sst_size += final_sst_info.num_entries as usize;
+        cf_file.add_file(file_id);
+        generated_ssts_info.push(final_sst_info);
+    }
+
+    info!(
+        "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total kv size {}, total sst size {}. raw_size_per_file {}, total takes {:?}",
+        file_id + 1,
+        cf,
+        stats.key_count,
+        stats.total_kv_size,
+        stats.total_sst_size,
+        raw_size_per_file,
+        instant.saturating_elapsed(),
+    );
+
+    if direct_ssts_info.is_some() {
+        // HACK(XXX): Used to indicate we have generated some data.
+        stats.key_count = 1;
+    }
+
+    Ok((
+        stats,
+        direct_ssts_info.unwrap_or_default(),
+        generated_ssts_info,
+    ))
+}
+
+/// Build a snapshot file for the given column family in sst format.
+/// If there are no key-value pairs fetched, no files will be created at `path`,
+/// otherwise the file will be created and synchronized.
+pub fn build_sst_cf_file_list<E>(
+    cf_file: &mut CfFile,
+    engine: &E,
+    snap: &E::Snapshot,
+    start_key: &[u8],
+    end_key: &[u8],
+    raw_size_per_file: u64,
+    io_limiter: &Limiter,
+    key_mgr: Option<Arc<DataKeyManager>>,
+    for_balance: bool,
+) -> Result<(BuildStatistics, Vec<SstFileInfo>), Error>
+where
+    E: KvEngine,
+{
+    let cf = cf_file.cf;
+    let mut stats = BuildStatistics::default();
+    let mut sst_file_infos = Vec::new(); // 用于存储 SstFileInfo
+    let mut remained_quota = 0;
+    let mut file_id: usize = 0;
+    let mut path = cf_file
+        .path
+        .join(cf_file.gen_tmp_file_name(file_id))
+        .to_str()
+        .unwrap()
+        .to_string();
+    let sst_writer = RefCell::new(create_sst_file_writer::<E>(engine, cf, &path)?);
+    let mut file_length: usize = 0;
+
+    let finish_sst_writer = |sst_writer: E::SstWriter,
+                             path: String,
+                             key_mgr: Option<Arc<DataKeyManager>>|
+     -> Result<SstFileInfo, Error> {
+        let info = sst_writer.finish()?;
+        (|| {
+            fail_point!("inject_sst_file_corruption", |_| {
+                static CALLED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if CALLED
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                // overwrite the file to break checksum
+                let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+                f.write_all(b"x").unwrap();
+            });
+        })();
+
+        let sst_reader = E::SstReader::open(&path, key_mgr)?;
+        if let Err(e) = sst_reader.verify_checksum() {
+            fs::remove_file(&path)?;
+            error!(
+                "failed to pass block checksum verification";
+                "file" => path,
+                "err" => ?e,
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidData, e).into());
+        }
+        File::open(&path).and_then(|f| f.sync_all())?;
+
+        // 从 info 中提取信息，构造 SstFileInfo
+        let sst_file_info = SstFileInfo {
+            file_name: path.clone(),
+            smallest_key: info.smallest_key().to_vec(),
+            largest_key: info.largest_key().to_vec(),
+            num_entries: info.num_entries(),
+        };
+        Ok(sst_file_info)
     };
 
     let instant = Instant::now();
@@ -233,9 +550,10 @@ where
             match result {
                 Ok(new_sst_writer) => {
                     let old_writer = sst_writer.replace(new_sst_writer);
-                    stats.total_sst_size +=
-                        box_try!(finish_sst_writer(old_writer, prev_path, key_mgr.clone()))
-                            as usize;
+                    let sst_info =
+                        box_try!(finish_sst_writer(old_writer, prev_path, key_mgr.clone()));
+                    stats.total_sst_size += sst_info.num_entries as usize;
+                    sst_file_infos.push(sst_info);
                 }
                 Err(e) => {
                     let io_error = io::Error::new(io::ErrorKind::Other, e);
@@ -248,8 +566,6 @@ where
         stats.total_kv_size += entry_len;
 
         if stats.total_kv_size >= next_io_check_size {
-            // TODO(@hhwyt): Consider incorporating snapshot file write I/O into the
-            // limiting mechanism.
             handle_read_io_usage(&mut io_tracker, &mut remained_quota);
             next_io_check_size = stats.total_kv_size + SCAN_BYTES_PER_IO_LIMIT_CHECK;
         }
@@ -261,28 +577,28 @@ where
         file_length += entry_len;
         Ok(true)
     }));
-    // Handle the IO generated by the remaining key-value pairs less than
-    // SCAN_BYTES_PER_IO_LIMIT_CHECK.
+
     handle_read_io_usage(&mut io_tracker, &mut remained_quota);
 
     if stats.key_count > 0 {
-        stats.total_sst_size +=
-            box_try!(finish_sst_writer(sst_writer.into_inner(), path, key_mgr)) as usize;
+        let final_sst_info = box_try!(finish_sst_writer(sst_writer.into_inner(), path, key_mgr));
+        stats.total_sst_size += final_sst_info.num_entries as usize;
         cf_file.add_file(file_id);
-        info!(
-            "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total kv size {}, total sst size {}. raw_size_per_file {}, total takes {:?}",
-            file_id + 1,
-            cf,
-            stats.key_count,
-            stats.total_kv_size,
-            stats.total_sst_size,
-            raw_size_per_file,
-            instant.saturating_elapsed(),
-        );
-    } else {
-        box_try!(fs::remove_file(path));
+        sst_file_infos.push(final_sst_info);
     }
-    Ok(stats)
+
+    info!(
+        "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total kv size {}, total sst size {}. raw_size_per_file {}, total takes {:?}",
+        file_id + 1,
+        cf,
+        stats.key_count,
+        stats.total_kv_size,
+        stats.total_sst_size,
+        raw_size_per_file,
+        instant.saturating_elapsed(),
+    );
+
+    Ok((stats, sst_file_infos))
 }
 
 /// Apply the given snapshot file into a column family. `callback` will be
@@ -483,15 +799,27 @@ pub fn get_decrypter_reader(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{collections::HashMap, iter::Iterator, path::PathBuf};
 
+    use engine_rocks::{
+        raw::{BlockBasedOptions, DBCompressionType},
+        util::new_engine_opt,
+        RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstPartitionerFactory,
+    };
     use engine_test::kv::KvTestEngine;
-    use engine_traits::CF_DEFAULT;
-    use tempfile::Builder;
+    use engine_traits::{CompactExt, MiscExt, SyncMutable, CF_DEFAULT};
+    use kvproto::metapb::Region;
+    use tempfile::{Builder, TempDir};
     use tikv_util::time::Limiter;
 
     use super::*;
-    use crate::store::snap::{tests::*, SNAPSHOT_CFS, SST_FILE_SUFFIX};
+    use crate::{
+        coprocessor::region_info_accessor::MockRegionInfoProvider,
+        store::{
+            snap::{tests::*, SNAPSHOT_CFS, SST_FILE_SUFFIX},
+            CompactionGuardGeneratorFactory,
+        },
+    };
 
     struct TestStaleDetector;
     impl StaleDetector for TestStaleDetector {
@@ -617,7 +945,8 @@ mod tests {
                         db_opt.as_ref().and_then(|opt| opt.get_key_manager()),
                         true,
                     )
-                    .unwrap();
+                    .unwrap()
+                    .0;
                     if stats.key_count == 0 {
                         assert_eq!(cf_file.file_paths().len(), 0);
                         assert_eq!(cf_file.clone_file_paths().len(), 0);
@@ -672,6 +1001,7 @@ mod tests {
 
         let dir = Builder::new().prefix("test-io-limiter").tempdir().unwrap();
         let db = open_test_db_with_nkeys(dir.path(), None, None, 1000).unwrap();
+        println!("path: {:?}", dir.path());
         // The max throughput is 8000 bytes/sec.
         let bytes_per_sec = 8000_f64;
         let limiter = Limiter::new(bytes_per_sec);
@@ -697,9 +1027,492 @@ mod tests {
             None,
             true,
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(stats.total_kv_size, 11890);
         // Must exceed 1 second!
         assert!(start.saturating_elapsed_secs() > 1_f64);
+    }
+
+    fn print_sst_files_info(sst_file_infos: &Vec<SstFileInfo>) {
+        for sst_file in sst_file_infos {
+            println!(
+                "Generated SST file for region {}: file_name = {}, smallest_key = {}, largest_key = {}, num_entries = {}",
+                1,
+                sst_file.file_name,
+                String::from_utf8_lossy(&sst_file.smallest_key), // 转换为字符串
+                String::from_utf8_lossy(&sst_file.largest_key),  // 转换为字符串
+                sst_file.num_entries,
+            );
+        }
+    }
+
+    fn level_files(db: &RocksEngine) -> collections::HashMap<usize, Vec<FileMetadata>> {
+        let db = db.as_inner();
+        let cf = db.cf_handle("default").unwrap();
+        let md = db.get_column_family_meta_data(cf);
+        let mut res: collections::HashMap<usize, Vec<FileMetadata>> =
+            collections::HashMap::default();
+        for (i, level) in md.get_levels().into_iter().enumerate() {
+            for file in level.get_files() {
+                res.entry(i).or_default().push(FileMetadata {
+                    name: file.get_name(),
+                    size: file.get_size(),
+                    smallest_key: file.get_smallestkey().to_owned(),
+                    largest_key: file.get_largestkey().to_owned(),
+                });
+            }
+        }
+        res
+    }
+
+    fn new_test_db(provider: MockRegionInfoProvider) -> (RocksEngine, TempDir) {
+        let temp_dir = Builder::new()
+            .prefix("test-build-lmax-sst")
+            .tempdir_in("/tmp")
+            .unwrap();
+        println!("Temporary directory created: {:?}", temp_dir);
+
+        const MIN_OUTPUT_FILE_SIZE: u64 = 1024 * 10;
+        const MAX_OUTPUT_FILE_SIZE: u64 = 1024 * 11;
+        const MAX_COMPACTION_SIZE: u64 = u64::MAX;
+        let mut cf_opts = RocksCfOptions::default();
+        cf_opts.set_max_bytes_for_level_base(MAX_OUTPUT_FILE_SIZE);
+        cf_opts.set_max_bytes_for_level_multiplier(5);
+        cf_opts.set_target_file_size_base(MAX_OUTPUT_FILE_SIZE);
+        cf_opts.set_level_compaction_dynamic_level_bytes(false);
+        cf_opts.set_sst_partitioner_factory(RocksSstPartitionerFactory(
+            CompactionGuardGeneratorFactory::new(
+                CF_DEFAULT,
+                provider,
+                MIN_OUTPUT_FILE_SIZE,
+                MAX_COMPACTION_SIZE,
+            )
+            .unwrap(),
+        ));
+        cf_opts.set_disable_auto_compactions(true);
+        cf_opts.compression_per_level(&[
+            DBCompressionType::No,
+            DBCompressionType::No,
+            DBCompressionType::No,
+            DBCompressionType::No,
+            DBCompressionType::No,
+            DBCompressionType::No,
+            DBCompressionType::No,
+        ]);
+        // Make block size small to make sure current_output_file_size passed to
+        // SstPartitioner is accurate.
+        let mut block_based_opts = BlockBasedOptions::new();
+        block_based_opts.set_block_size(100);
+        cf_opts.set_block_based_table_factory(&block_based_opts);
+
+        let db = new_engine_opt(
+            temp_dir.path().to_str().unwrap(),
+            RocksDbOptions::default(),
+            vec![(CF_DEFAULT, cf_opts)],
+        )
+        .unwrap();
+        (db, temp_dir)
+    }
+
+    // region 1, lmax 有数据，non-lmax 也有数据，lmax 独占文件
+    // region 2, lmax 有数据，non-lmax 没数据，lmax 独占文件
+    // region 3, lmax 有数据，non-lmax 没数据，lmax 只有一个文件，且共享
+    // region 4, lmax 有数据，non-lmax 有数据，lmax 共享文件
+    // region 5, lmax 有数据，non-lmax 没数据，lmax 有多个文件，其中一个共享
+    // region 6, lmax 没数据，non-lmax 有数据
+    #[test]
+    fn test_build_lmax_sst() {
+        let provider = MockRegionInfoProvider::new(vec![
+            Region {
+                id: 1,
+                start_key: b"a".to_vec(),
+                end_key: b"b".to_vec(),
+                ..Default::default()
+            },
+            Region {
+                id: 2,
+                start_key: b"b".to_vec(),
+                end_key: b"c".to_vec(),
+                ..Default::default()
+            },
+            Region {
+                id: 3,
+                start_key: b"c".to_vec(),
+                end_key: b"d".to_vec(),
+                ..Default::default()
+            },
+            Region {
+                id: 4,
+                start_key: b"d".to_vec(),
+                end_key: b"e".to_vec(),
+                ..Default::default()
+            },
+            Region {
+                id: 5,
+                start_key: b"e".to_vec(),
+                end_key: b"f".to_vec(),
+                ..Default::default()
+            },
+            Region {
+                id: 6,
+                start_key: b"f".to_vec(),
+                end_key: b"g".to_vec(),
+                ..Default::default()
+            },
+        ]);
+        let (db, dir) = new_test_db(provider);
+
+        {
+            let value = vec![b'v'; 1000];
+            // region 1, lmax 有数据，non-lmax 也有数据，lmax 独占文件两个文件
+            {
+                ['a']
+                    .into_iter()
+                    .flat_map(|x| (1..=15).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+                db.compact_files_in_range(None, None, Some(2)).unwrap();
+            }
+
+            {
+                ['b']
+                    .into_iter()
+                    .flat_map(|x| (1..=10).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+                db.compact_files_in_range(None, None, Some(2)).unwrap();
+            }
+
+            {
+                ['c']
+                    .into_iter()
+                    .flat_map(|x| (1..=3).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+            }
+
+            {
+                ['d']
+                    .into_iter()
+                    // 13 是为了和 c?? 以及 e?? 共享一个文件，然后自己再独占一个文件
+                    .flat_map(|x| (1..=23).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+            }
+
+            {
+                ['e']
+                    .into_iter()
+                    // 13 是为了和 c?? 以及 e?? 共享一个文件，然后自己再独占一个文件
+                    .flat_map(|x| (1..=13).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+            }
+            db.compact_files_in_range(None, None, Some(2)).unwrap();
+
+            /////////////// no -lmax
+            let tiny_value = [b'v'; 1];
+            {
+                ['a']
+                    .into_iter()
+                    .flat_map(|x| (1..=10).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &tiny_value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+                db.compact_files_in_range(None, None, Some(1)).unwrap();
+            }
+
+            {
+                ['e']
+                    .into_iter()
+                    .flat_map(|x| (1..=10).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &tiny_value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+                db.compact_files_in_range(None, None, Some(1)).unwrap();
+            }
+
+            {
+                ['f']
+                    .into_iter()
+                    .flat_map(|x| (1..=10).map(move |n| format!("z{x}{:02}", n).into_bytes()))
+                    .for_each(|key| db.put(&key, &tiny_value).unwrap());
+                db.flush_cfs(&[], true).unwrap();
+                db.compact_files_in_range(None, None, Some(1)).unwrap();
+            }
+
+            let level_2 = &level_files(&db)[&2];
+            assert_eq!(level_2.len(), 7);
+            let level_1 = &level_files(&db)[&1];
+            assert_eq!(level_1.len(), 3);
+        }
+
+        // Test region1
+        {
+            let limiter = Limiter::new(f64::INFINITY);
+            let snap_dir = Builder::new()
+                .prefix("snap-dir")
+                .tempdir_in("/tmp")
+                .unwrap();
+            println!("Snap directory created: {:?}", snap_dir);
+            let mut cf_file = CfFile {
+                cf: CF_DEFAULT,
+                path: PathBuf::from(snap_dir.path()),
+                file_prefix: "test_sst".to_string(),
+                file_suffix: SST_FILE_SUFFIX.to_string(),
+                ..Default::default()
+            };
+
+            let (stats, filter_files, sst_file_infos) = build_sst_cf_file_list_new::<KvTestEngine>(
+                &mut cf_file,
+                &db,
+                &db.snapshot(),
+                &keys::data_key(b"a"),
+                &keys::data_key(b"b"),
+                u64::MAX,
+                &limiter,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(filter_files.len(), 2);
+            assert_eq!(sst_file_infos.len(), 1);
+            assert_eq!(
+                filter_files[0],
+                FileMetadata {
+                    name: "test_sst.sst.tmp".to_string(),
+                    size: 11423,
+                    smallest_key: "za01".as_bytes().to_vec(),
+                    largest_key: "za10".as_bytes().to_vec(),
+                }
+            );
+            assert_eq!(
+                filter_files[1],
+                FileMetadata {
+                    name: "test_sst_0001.sst.tmp".to_string(),
+                    size: 6208,
+                    smallest_key: "za11".as_bytes().to_vec(),
+                    largest_key: "za15".as_bytes().to_vec(),
+                }
+            );
+            assert_eq!(
+                sst_file_infos[0],
+                SstFileInfo {
+                    file_name: "test_sst_0002.sst.tmp".to_string(),
+                    smallest_key: "za01".as_bytes().to_vec(),
+                    largest_key: "za10".as_bytes().to_vec(),
+                    num_entries: 10,
+                }
+            );
+        }
+
+        // Test region2
+        {
+            let limiter = Limiter::new(f64::INFINITY);
+            let snap_dir = Builder::new()
+                .prefix("snap-dir")
+                .tempdir_in("/tmp")
+                .unwrap();
+            println!("Snap directory created: {:?}", snap_dir);
+            let mut cf_file = CfFile {
+                cf: CF_DEFAULT,
+                path: PathBuf::from(snap_dir.path()),
+                file_prefix: "test_sst".to_string(),
+                file_suffix: SST_FILE_SUFFIX.to_string(),
+                ..Default::default()
+            };
+
+            let (stats, filter_files, sst_file_infos) = build_sst_cf_file_list_new::<KvTestEngine>(
+                &mut cf_file,
+                &db,
+                &db.snapshot(),
+                &keys::data_key(b"b"),
+                &keys::data_key(b"c"),
+                u64::MAX,
+                &limiter,
+                None,
+                true,
+            )
+            .unwrap();
+            print_sst_files_info(&sst_file_infos);
+            assert_eq!(filter_files.len(), 1);
+            assert_eq!(sst_file_infos.len(), 0);
+            assert_eq!(
+                filter_files[0],
+                FileMetadata {
+                    name: "test_sst.sst.tmp".to_string(),
+                    size: 11423,
+                    smallest_key: "zb01".as_bytes().to_vec(),
+                    largest_key: "zb10".as_bytes().to_vec(),
+                }
+            );
+        }
+
+        // Test region3
+        {
+            let limiter = Limiter::new(f64::INFINITY);
+            let snap_dir = Builder::new()
+                .prefix("snap-dir")
+                .tempdir_in("/tmp")
+                .unwrap();
+            println!("Snap directory created: {:?}", snap_dir);
+            let mut cf_file = CfFile {
+                cf: CF_DEFAULT,
+                path: PathBuf::from(snap_dir.path()),
+                file_prefix: "test_sst".to_string(),
+                file_suffix: SST_FILE_SUFFIX.to_string(),
+                ..Default::default()
+            };
+
+            let (stats, filter_files, sst_file_infos) = build_sst_cf_file_list_new::<KvTestEngine>(
+                &mut cf_file,
+                &db,
+                &db.snapshot(),
+                &keys::data_key(b"c"),
+                &keys::data_key(b"d"),
+                u64::MAX,
+                &limiter,
+                None,
+                true,
+            )
+            .unwrap();
+            print_sst_files_info(&sst_file_infos);
+            assert_eq!(filter_files.len(), 0);
+            assert_eq!(sst_file_infos.len(), 1);
+            assert_eq!(
+                sst_file_infos[0],
+                SstFileInfo {
+                    file_name: "test_sst.sst.tmp".to_string(),
+                    smallest_key: "zc01".as_bytes().to_vec(),
+                    largest_key: "zc03".as_bytes().to_vec(),
+                    num_entries: 3,
+                }
+            );
+        }
+
+        // Test region4
+        {
+            let limiter = Limiter::new(f64::INFINITY);
+            let snap_dir = Builder::new()
+                .prefix("snap-dir")
+                .tempdir_in("/tmp")
+                .unwrap();
+            println!("Snap directory created: {:?}", snap_dir);
+            let mut cf_file = CfFile {
+                cf: CF_DEFAULT,
+                path: PathBuf::from(snap_dir.path()),
+                file_prefix: "test_sst".to_string(),
+                file_suffix: SST_FILE_SUFFIX.to_string(),
+                ..Default::default()
+            };
+
+            let (stats, filter_files, sst_file_infos) = build_sst_cf_file_list_new::<KvTestEngine>(
+                &mut cf_file,
+                &db,
+                &db.snapshot(),
+                &keys::data_key(b"d"),
+                &keys::data_key(b"e"),
+                u64::MAX,
+                &limiter,
+                None,
+                true,
+            )
+            .unwrap();
+            print_sst_files_info(&sst_file_infos);
+            assert_eq!(filter_files.len(), 0);
+            assert_eq!(sst_file_infos.len(), 1);
+            assert_eq!(
+                sst_file_infos[0],
+                SstFileInfo {
+                    file_name: "test_sst.sst.tmp".to_string(),
+                    smallest_key: "zd01".as_bytes().to_vec(),
+                    largest_key: "zd23".as_bytes().to_vec(),
+                    num_entries: 23,
+                }
+            );
+        }
+
+        // Test region5
+        {
+            let limiter = Limiter::new(f64::INFINITY);
+            let snap_dir = Builder::new()
+                .prefix("snap-dir")
+                .tempdir_in("/tmp")
+                .unwrap();
+            println!("Snap directory created: {:?}", snap_dir);
+            let mut cf_file = CfFile {
+                cf: CF_DEFAULT,
+                path: PathBuf::from(snap_dir.path()),
+                file_prefix: "test_sst".to_string(),
+                file_suffix: SST_FILE_SUFFIX.to_string(),
+                ..Default::default()
+            };
+
+            let (stats, filter_files, sst_file_infos) = build_sst_cf_file_list_new::<KvTestEngine>(
+                &mut cf_file,
+                &db,
+                &db.snapshot(),
+                &keys::data_key(b"e"),
+                &keys::data_key(b"f"),
+                u64::MAX,
+                &limiter,
+                None,
+                true,
+            )
+            .unwrap();
+            print_sst_files_info(&sst_file_infos);
+            assert_eq!(filter_files.len(), 0);
+            assert_eq!(sst_file_infos.len(), 1);
+            assert_eq!(
+                sst_file_infos[0],
+                SstFileInfo {
+                    file_name: "test_sst.sst.tmp".to_string(),
+                    smallest_key: "ze01".as_bytes().to_vec(),
+                    largest_key: "ze13".as_bytes().to_vec(),
+                    num_entries: 13,
+                }
+            );
+        }
+
+        // Test region6
+        {
+            let limiter = Limiter::new(f64::INFINITY);
+            let snap_dir = Builder::new()
+                .prefix("snap-dir")
+                .tempdir_in("/tmp")
+                .unwrap();
+            println!("Snap directory created: {:?}", snap_dir);
+            let mut cf_file = CfFile {
+                cf: CF_DEFAULT,
+                path: PathBuf::from(snap_dir.path()),
+                file_prefix: "test_sst".to_string(),
+                file_suffix: SST_FILE_SUFFIX.to_string(),
+                ..Default::default()
+            };
+
+            let (stats, filter_files, sst_file_infos) = build_sst_cf_file_list_new::<KvTestEngine>(
+                &mut cf_file,
+                &db,
+                &db.snapshot(),
+                &keys::data_key(b"f"),
+                &keys::data_key(b"g"),
+                u64::MAX,
+                &limiter,
+                None,
+                true,
+            )
+            .unwrap();
+            print_sst_files_info(&sst_file_infos);
+            assert_eq!(filter_files.len(), 0);
+            assert_eq!(sst_file_infos.len(), 1);
+            assert_eq!(
+                sst_file_infos[0],
+                SstFileInfo {
+                    file_name: "test_sst.sst.tmp".to_string(),
+                    smallest_key: "zf01".as_bytes().to_vec(),
+                    largest_key: "zf10".as_bytes().to_vec(),
+                    num_entries: 10,
+                }
+            );
+        }
     }
 }

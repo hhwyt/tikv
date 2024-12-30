@@ -1,13 +1,11 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::ops::Deref;
-
 use engine_traits::{
-    CfNamesExt, IterMetricsCollector, IterOptions, Iterable, Iterator, MetricsExt, Peekable,
-    ReadOptions, Result, Snapshot, SnapshotMiscExt,
+    CfNamesExt, FileMetadata, IterMetricsCollector, IterOptions, Iterable, Iterator, MetricsExt,
+    Peekable, ReadOptions, Result, Snapshot, SnapshotMiscExt,
 };
 
-use crate::{db_vector::PanicDbVector, engine::PanicEngine};
+use crate::db_vector::PanicDbVector;
 
 #[derive(Clone, Debug)]
 pub struct PanicSnapshot;
@@ -35,6 +33,14 @@ impl Iterable for PanicSnapshot {
     type Iterator = PanicSnapshotIterator;
 
     fn iterator_opt(&self, cf: &str, opts: IterOptions) -> Result<Self::Iterator> {
+        panic!()
+    }
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)> {
         panic!()
     }
 }

@@ -6,7 +6,7 @@ use std::{
 };
 
 use engine_traits::{
-    self, CfNamesExt, IterOptions, Iterable, Peekable, ReadOptions, Result, Snapshot,
+    self, CfNamesExt, FileMetadata, IterOptions, Iterable, Peekable, ReadOptions, Result, Snapshot,
     SnapshotMiscExt,
 };
 use rocksdb::{rocksdb_options::UnsafeSnap, DBIterator, DB};
@@ -50,7 +50,6 @@ impl Drop for RocksSnapshot {
         }
     }
 }
-
 impl Iterable for RocksSnapshot {
     type Iterator = RocksEngineIterator;
 
@@ -66,6 +65,42 @@ impl Iterable for RocksSnapshot {
             handle,
             opt,
         )))
+    }
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)> {
+        let opt: RocksReadOptions = opts.into();
+        let mut opt = opt.into_raw();
+        unsafe {
+            opt.set_snapshot(&self.snap);
+        }
+        let handle = get_cf_handle(self.db.as_ref(), cf)?;
+        let (db_iter, cf_metadata) =
+            DBIterator::new_cf_and_get_metadata(self.db.clone(), handle, opt);
+        let levels = cf_metadata.get_levels();
+        let files_metadata_by_level = levels
+            .iter()
+            .map(|level_meta| {
+                level_meta
+                    .get_files()
+                    .iter()
+                    .map(|sst_meta| FileMetadata {
+                        name: sst_meta.get_name().clone(),
+                        size: sst_meta.get_size() as usize,
+                        smallest_key: sst_meta.get_smallestkey().clone().into(),
+                        largest_key: sst_meta.get_largestkey().clone().into(),
+                    })
+                    .collect()
+            })
+            .collect();
+
+        Ok((
+            RocksEngineIterator::from_raw(db_iter),
+            files_metadata_by_level,
+        ))
     }
 }
 

@@ -60,6 +60,7 @@ use txn_types::WriteBatchFlags;
 
 use super::*;
 use crate::Config;
+
 // We simulate 3 or 5 nodes, each has a store.
 // Sometimes, we use fixed id to test, which means the id
 // isn't allocated by pd, and node id, store id are same.
@@ -1117,6 +1118,21 @@ impl<T: Simulator> Cluster<T> {
     pub fn must_flush_cf(&mut self, cf: &str, sync: bool) {
         for engines in &self.dbs {
             engines.kv.flush_cf(cf, sync).unwrap();
+        }
+    }
+
+    pub fn must_compact_files_in_range_cf(
+        &mut self,
+        cf: &str,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        output_level: Option<i32>,
+    ) {
+        for engines in &self.dbs {
+            engines
+                .kv
+                .compact_files_in_range_cf(cf, start, end, output_level)
+                .unwrap();
         }
     }
 

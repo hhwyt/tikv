@@ -7,7 +7,7 @@
 
 use crate::{
     cf_names::CfNamesExt, errors::Result, flow_control_factors::FlowControlFactorsExt,
-    range::Range, KvEngine, WriteBatchExt, WriteOptions,
+    range::Range, FileMetadata, KvEngine, WriteBatchExt, WriteOptions,
 };
 
 #[derive(Clone, Debug)]
@@ -77,7 +77,6 @@ impl RangeStats {
             .saturating_add(self.num_deletes)
     }
 }
-
 pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
     type StatisticsReporter: StatisticsReporter<Self>;
 
@@ -122,6 +121,10 @@ pub trait MiscExt: CfNamesExt + FlowControlFactorsExt + WriteBatchExt {
     fn ingest_maybe_slowdown_writes(&self, cf: &str) -> Result<bool>;
 
     fn get_sst_key_ranges(&self, cf: &str, level: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    fn get_lmax(&self, cf: &str) -> Result<usize>;
+
+    fn get_level_metadata(&self, cf: &str, level: usize) -> Result<Vec<FileMetadata>>;
 
     /// Gets total used size of rocksdb engine, including:
     /// * total size (bytes) of all SST files.

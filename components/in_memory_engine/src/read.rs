@@ -8,9 +8,9 @@ use crossbeam::epoch;
 use crossbeam_skiplist::{base::OwnedIter, SkipList};
 use engine_rocks::{raw::SliceTransform, util::FixedSuffixSliceTransform};
 use engine_traits::{
-    CacheRegion, CfNamesExt, DbVector, Error, FailedReason, IterMetricsCollector, IterOptions,
-    Iterable, Iterator, MetricsExt, Peekable, ReadOptions, Result, Snapshot, SnapshotMiscExt,
-    CF_DEFAULT,
+    CacheRegion, CfNamesExt, DbVector, Error, FailedReason, FileMetadata, IterMetricsCollector,
+    IterOptions, Iterable, Iterator, MetricsExt, Peekable, ReadOptions, Result, Snapshot,
+    SnapshotMiscExt, CF_DEFAULT,
 };
 use prometheus::local::LocalHistogram;
 use slog_global::error;
@@ -161,6 +161,14 @@ impl Iterable for RegionCacheSnapshot {
             seek_duration: IN_MEMORY_ENGINE_SEEK_DURATION.local(),
             snapshot_read_ts: self.snapshot_meta.snapshot_ts,
         })
+    }
+
+    fn iterator_opt_and_get_metadata(
+        &self,
+        cf: &str,
+        opts: IterOptions,
+    ) -> Result<(Self::Iterator, Vec<Vec<FileMetadata>>)> {
+        panic!()
     }
 }
 

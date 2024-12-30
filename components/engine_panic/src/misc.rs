@@ -1,7 +1,8 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine_traits::{
-    DeleteStrategy, MiscExt, Range, RangeStats, Result, StatisticsReporter, WriteOptions,
+    DeleteStrategy, FileMetadata, MiscExt, Range, RangeStats, Result, StatisticsReporter,
+    WriteOptions,
 };
 
 use crate::engine::PanicEngine;
@@ -60,6 +61,14 @@ impl MiscExt for PanicEngine {
     }
 
     fn get_sst_key_ranges(&self, cf: &str, level: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        panic!()
+    }
+
+    fn get_lmax(&self, cf: &str) -> Result<usize> {
+        panic!()
+    }
+
+    fn get_level_metadata(&self, cf: &str, level: usize) -> Result<Vec<FileMetadata>> {
         panic!()
     }
 
