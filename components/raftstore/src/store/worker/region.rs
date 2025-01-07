@@ -370,6 +370,7 @@ where
             "region_id" => region_id,
             "time_takes" => ?timer.saturating_elapsed(),
         );
+        fail_point!("apply_snapshot_finished");
         Ok(())
     }
 
@@ -486,6 +487,7 @@ where
     /// Cleans up data in the given range and all pending ranges overlapping
     /// with it.
     fn clean_overlap_ranges(&mut self, start_key: Vec<u8>, end_key: Vec<u8>) -> Result<()> {
+        fail_point!("before_clean_overlap_ranges", |_| { Ok(()) });
         let (start_key, end_key) = self.clean_overlap_ranges_roughly(start_key, end_key);
         self.delete_all_in_range(&[Range::new(&start_key, &end_key)])
     }
@@ -510,6 +512,7 @@ where
 
     /// Cleans up stale ranges.
     fn clean_stale_ranges(&mut self) {
+        fail_point!("before_clean_stale_ranges", |_| {});
         STALE_PEER_PENDING_DELETE_RANGE_GAUGE.set(self.pending_delete_ranges.len() as f64);
         if self.ingest_maybe_stall() {
             return;

@@ -87,7 +87,13 @@ impl RocksEngine {
 
         if let Some(writer) = writer_wrapper {
             writer.finish()?;
-            self.ingest_external_file_cf(cf, &[sst_path.as_str()])?;
+            // TODO(hhwyt): Currently, Delete by ingest does not enable `RocksDB
+            // IngestExternalFileOptions.allow_write = true`. Enabling it in the
+            // future could minimize the impact on foreground performance.
+            // However, it is not enabled now due to the following reasons:
+            // 1. destroy-peer ingest might be deprecated in favor of https://github.com/tikv/tikv/pull/18040.
+            // 2. `clean_overlap_range` is not very common.
+            self.ingest_external_file_cf(cf, &[sst_path.as_str()], None)?;
         } else {
             let mut wb = self.write_batch();
             for key in data.iter() {
