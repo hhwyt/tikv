@@ -126,13 +126,14 @@ fn create_azure_backend(
     let mut config = KmsConfig::default();
 
     config.vendor = STORAGE_VENDOR_NAME_AZURE.to_owned();
+    config.key_id = cmd.key_id.to_owned();
     let mut azure_cfg = AzureConfig::default();
     azure_cfg.tenant_id = cmd.tenant_id.to_owned();
     azure_cfg.client_id = cmd.client_id.to_owned();
-    config.key_id = cmd.key_id.to_owned();
     azure_cfg.keyvault_url = cmd.url.to_owned();
     azure_cfg.client_secret = cmd.secret.to_owned();
     azure_cfg.client_certificate_path = credential_file.cloned();
+    config.azure = Some(azure_cfg);
     if let Some(credential_file) = credential_file {
         let ini = Ini::load_from_file(credential_file)
             .map_err(|e| Error::Other(box_err!("Failed to parse credential file as ini: {}", e)))?;
